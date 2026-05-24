@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>Gemini Live API - Tab Audio to Text</title>
+  <style>
+    body { font-family: sans-serif; padding: 20px; }
+    #log { white-space: pre-wrap; background: #f0f0f0; padding: 10px; height: 400px; overflow-y: auto; border: 1px solid #ccc; }
+    .controls { margin-bottom: 20px; }
+  </style>
+</head>
+<body>
+  <h2>ブラウザタブの音声をGeminiに渡してテキスト返答を得る</h2>
+  
+  <div class="controls">
+    <input type="password" id="apiKey" placeholder="Gemini API Key" size="50">
+    <button id="startBtn">タブ音声の取得と接続開始</button>
+    <button id="stopBtn" disabled>停止</button>
+  </div>
+
+  <div id="log"></div>
+
+  <script>
+    // const MODEL_NAME = "gemini-2.0-flash-exp"; // ※Live API対応モデルを指定（適宜最新のものに変更してください）
+    const MODEL_NAME = "gemini-3.1-flash-live-preview"; // ※Live API対応モデルを指定（適宜最新のものに変更してください）
+    
+    let websocket = null;
+    let audioContext = null;
+    let mediaStream = null;
+    let processor = null;
+
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const logDiv = document.getElementById('log');
+
+    function log(message, isGemini = false) {
+      const p = document.createElement('div');
+      p.style.color = isGemini ? "blue" : "black";
+      p.textContent = message;
+      logDiv.appendChild(p);
+      logDiv.scrollTop = logDiv.scrollHeight;
+    }
+
+    startBtn.onclick = async () => {
+      const apiKey = document.getElementById('apiKey').value;
+      if (!apiKey) {
+        alert("APIキーを入力してください。");
+        return;
+      }
+
+      try {
+        // 1. 画面共有でタブの音声を取得する (ユーザーにタブを選ばせる)
+        mediaStream = await navigator.mediaDevices.getDisplayMedia({
+          video: true, // タブ共有ダイアログを出すために必要
+          audio: true  // 音声の取得を要求
+        });
+
+        const audioTrack = mediaStream.getAudioTracks()[0];
+        if (!audioTrack) {
+          alert("音声が取得できませんでした。タブを共有する際、「タブの音声を共有」にチェックを入れてください。");
+          return;
+        }
+
+        // 2. WebSocketの接続
+        const wsUrl = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${apiKey}`;
+        websocket = new WebSocket(wsUrl);
+
+        websocket.onopen = () => {
+          log('システム: WebSocket 接続完了');
+          
+          // セットアップメッセージの送信 (TEXT出力に設定)
+          const setupMessage = {
+            setup: {
+              model: `models/${MODEL_NAME}`,
+              generationConfig: {
+                // responseModalities: ['TEXT'] // テキストで返答をもらう
+                responseModalities: ['AUDIO'] // テキストで返答をもらう
+              },
+              systemInstruction: {
+                parts: [{ text: 'あなたは優秀なAIアシスタントです。入力された音声の内容について、テキストで簡潔にリアルタイムで反応や回答をしてください。' }]
+              }
+            }
+          };
+          websocket.send(JSON.stringify(setupMessage));
+        };
+
+        websocket.onmessage = async (event) => {
+          let dataStr = typeof event.data === 'string' ? event.data : await event.data.text();
+          try {
+            const response = JSON.parse(dataStr);
+
+            if (response.setupComplete) {
+              log('システム: セットアップ完了。音声のストリーミングを開始します。');
+              startAudioProcessing();
+            }
+
+            // if (response.serverContent) {
+            //   const serverContent = response.serverContent;
+            //   
+            //   // テキストの返答を受信
+            //   if (serverContent.modelTurn?.parts) {
+            //     for (const part of serverContent.modelTurn.parts) {
+            //       if (part.text) {
+            //         log(`Gemini: ${part.text}`, true);
+            //       }
+            //     }
+            //   }
+            // }
+            if (response.serverContent) {
+              const serverContent = response.serverContent;
+              
+              // 1. モデルの返答（テキストパーツが含まれている場合）
+              if (serverContent.modelTurn?.parts) {
+                for (const part of serverContent.modelTurn.parts) {
+                  if (part.text) {
+                    log(`Gemini: ${part.text}`, true);
+                  }
+                  // 音声データ (part.inlineData) が送られてきても無視して再生しない
+                }
+              }
+
+              // 2. モデルの音声出力に対する文字起こし（APIバージョンによってはこちらに入ります）
+              if (serverContent.outputTranscription) {
+                log(`Gemini: ${serverContent.outputTranscription.text}`, true);
+              }
+
+              // 3. ユーザー（タブ）の音声がどう認識されたか（文字起こし）も表示する場合
+              if (serverContent.inputTranscription) {
+                log(`ユーザー(認識された音声): ${serverContent.inputTranscription.text}`);
+              }
+            }
+          } catch (e) {
+            console.error('JSON解析エラー:', e);
+          }
+        };
+
+        websocket.onerror = (error) => log(`システムエラー: WebSocketエラーが発生しました`);
+        // websocket.onclose = () => log('システム: WebSocket 切断');
+	// 以下に差し替える
+        websocket.onclose = (event) => {
+        log(`システム: WebSocket 切断 (コード: ${event.code}, 理由: ${event.reason || '記載なし'})`);
+        };
+
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+
+      } catch (err) {
+        console.error(err);
+        log(`システムエラー: ${err.message}`);
+      }
+    };
+
+    // 音声を16kHzのPCMに変換して送信する処理
+    function startAudioProcessing() {
+      // Geminiが要求する16000HzでAudioContextを作成
+      audioContext = new AudioContext({ sampleRate: 16000 });
+      const source = audioContext.createMediaStreamSource(mediaStream);
+      
+      // 音声処理用のノード (バッファサイズ: 4096, 入力: 1, 出力: 1)
+      processor = audioContext.createScriptProcessor(4096, 1, 1);
+
+      processor.onaudioprocess = (e) => {
+        const inputData = e.inputBuffer.getChannelData(0);
+        
+        // Float32 を 16bit PCM (Int16) に変換
+        const pcmData = new Int16Array(inputData.length);
+        for (let i = 0; i < inputData.length; i++) {
+          let s = Math.max(-1, Math.min(1, inputData[i]));
+          pcmData[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        }
+
+        // Int16Array を Base64 文字列に変換
+        const buffer = new Uint8Array(pcmData.buffer);
+        let binary = '';
+        for (let i = 0; i < buffer.byteLength; i++) {
+          binary += String.fromCharCode(buffer[i]);
+        }
+        const base64Audio = btoa(binary);
+
+        // WebSocketで送信
+        if (websocket && websocket.readyState === WebSocket.OPEN) {
+          websocket.send(JSON.stringify({
+            realtimeInput: {
+              audio: {
+                data: base64Audio,
+                mimeType: 'audio/pcm;rate=16000'
+            }
+              // mediaChunks: [{
+              //   mimeType: "audio/pcm;rate=16000",
+              //   data: base64Audio
+              // }]
+            }
+          }));
+        }
+      };
+
+      source.connect(processor);
+      // ScriptProcessorを動作させるためにダミーでdestinationに繋ぐ
+      processor.connect(audioContext.destination); 
+    }
+
+    stopBtn.onclick = () => {
+      if (websocket) websocket.close();
+      if (processor) processor.disconnect();
+      if (audioContext) audioContext.close();
+      if (mediaStream) mediaStream.getTracks().forEach(track => track.stop());
+      
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+      log('システム: 停止しました。');
+    };
+  </script>
+</body>
+</html>
