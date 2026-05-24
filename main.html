@@ -14,6 +14,7 @@
   
   <div class="controls">
     <input type="password" id="apiKey" placeholder="Gemini API Key" size="50">
+    <input type="file" id="contextFile" accept="text/plain">
     <button id="startBtn">タブ音声の取得と接続開始</button>
     <button id="stopBtn" disabled>停止</button>
   </div>
@@ -47,6 +48,19 @@
         alert("APIキーを入力してください。");
         return;
       }
+      
+      // --- [追加] テキストファイルの読み込み ---
+      const fileInput = document.getElementById('contextFile');
+      let contextText = "";
+      if (fileInput.files && fileInput.files.length > 0) {
+        try {
+          contextText = await fileInput.files[0].text();
+          log(`システム: 前提条件ファイルを読み込みました（${contextText.length}文字）`);
+        } catch (e) {
+          alert("ファイルの読み込みに失敗しました。");
+          return;
+        }
+      }
 
       try {
         // 1. 画面共有でタブの音声を取得する (ユーザーにタブを選ばせる)
@@ -67,6 +81,14 @@
 
         websocket.onopen = () => {
           log('システム: WebSocket 接続完了');
+
+	  // --- [変更] システムプロンプトの構築 ---
+          let instructionText = 'あなたは優秀なAIアシスタントです。入力された音声の内容について、テキストで簡潔にリアルタイムで反応や回答をしてください。';
+          
+          // ファイルが読み込まれていれば、指示文に追加する
+          if (contextText) {
+            instructionText += `\n\n以下の内容は、これから流れてくる音声の前提となる情報です。これを踏まえて回答してください：\n---\n${contextText}\n---`;
+          }
           
           // セットアップメッセージの送信 (TEXT出力に設定)
           const setupMessage = {
@@ -77,7 +99,8 @@
                 responseModalities: ['AUDIO'] // テキストで返答をもらう
               },
               systemInstruction: {
-                parts: [{ text: 'あなたは優秀なAIアシスタントです。入力された音声の内容について、テキストで簡潔にリアルタイムで反応や回答をしてください。' }]
+                // parts: [{ text: 'あなたは優秀なAIアシスタントです。入力された音声の内容について、テキストで簡潔にリアルタイムで反応や回答をしてください。' }]
+                parts: [{ text: instructionText }]
               }
             }
           };
